@@ -19,8 +19,10 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "gpio.h"
-#include "stm32f1xx_hal_def.h"
 #include "usart.h"
+#include "usb_device.h"
+#include "usbd_midi.h"
+
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -45,17 +47,16 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-uint8_t midi_rx_byte;            // pojedynczy odebrany bajt z UART2
-uint8_t last_status = 0;         // zapamiętany ostatni status (running status)
-uint8_t midi_data[2];            // bufor danych MIDI (DATA1, DATA2)
-uint8_t data_count = 0;          // ile danych już odebrano
+uint8_t midi_rx_byte;    // pojedynczy odebrany bajt z UART2
+uint8_t last_status = 0; // zapamiętany ostatni status (running status)
+uint8_t midi_data[2];    // bufor danych MIDI (DATA1, DATA2)
+uint8_t data_count = 0;  // ile danych już odebrano
 
-char uart_tx_buf[64];            // bufor do wysyłania tekstu na PC
+char uart_tx_buf[64]; // bufor do wysyłania tekstu na PC
 
-const char *note_names[12] = {
-    "C", "C#", "D", "D#", "E", "F",
-    "F#", "G", "G#", "A", "A#", "B"
-};
+const char *note_names[12] = {"C",  "C#", "D",  "D#", "E",  "F",
+                              "F#", "G",  "G#", "A",  "A#", "B"};
+uint8_t usb_midi_packet[4];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -66,60 +67,72 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART2)
+static void USB_MIDI_SendNote(uint8_t note, uint8_t velocity, uint8_t channel,
+                              uint8_t note_on) {
+  // sprawdzamy czy endpoint wolny
+  if (USBD_MIDI_GetState(&hUsbDeviceFS) != MIDI_IDLE)
+    return;
+
+  if (note_on) {
+    usb_midi_packet[0] = 0x09; // CIN: Note On
+    usb_midi_packet[1] = 0x90 | (channel & 0x0F);
+  } else {
+    usb_midi_packet[0] = 0x08; // CIN: Note Off
+    usb_midi_packet[1] = 0x80 | (channel & 0x0F);
+  }
+
+  usb_midi_packet[2] = note;
+  usb_midi_packet[3] = velocity;
+
+  USBD_MIDI_SendPackets(&hUsbDeviceFS, usb_midi_packet, MIDI_EPIN_SIZE);
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+  if (huart->Instance == USART2) {
+    uint8_t byte = midi_rx_byte;
+
+    if (byte & 0x80) // status byte
     {
-        uint8_t byte = midi_rx_byte;
+      last_status = byte;
+      data_count = 0; // reset licznika danych
+    } else            // data byte
+    {
+      if (last_status == 0) {
+        // brak statusu → ignorujemy
+        goto next_byte;
+      }
 
-        if (byte & 0x80) // status byte
-        {
-            last_status = byte;
-            data_count = 0; // reset licznika danych
-        }
-        else // data byte
-        {
-            if (last_status == 0)
-            {
-                // brak statusu → ignorujemy
-                goto next_byte;
-            }
+      midi_data[data_count++] = byte;
 
-            midi_data[data_count++] = byte;
+      // NOTE ON / OFF potrzebuje 2 bajtów danych
+      uint8_t cmd = last_status & 0xF0;
+      if((cmd == 0x90 || cmd == 0x80) && data_count == 2) {
+        uint8_t note = midi_data[0];
+        uint8_t velocity = midi_data[1];
+        uint8_t channel = (last_status & 0x0F) + 1;
 
-            // NOTE ON / OFF potrzebuje 2 bajtów danych
-            uint8_t cmd = last_status & 0xF0;
-            if ((cmd == 0x90 || cmd == 0x80) && data_count == 2)
-            {
-                uint8_t note = midi_data[0];
-                uint8_t velocity = midi_data[1];
-                uint8_t channel = (last_status & 0x0F) + 1;
+        uint8_t note_on = (cmd == 0x90 && velocity > 0);
 
-                uint8_t note_on = (cmd == 0x90 && velocity > 0);
+        int octave = (note / 12);
+        const char *name = note_names[note % 12];
 
-                int octave = (note / 12);
-                const char *name = note_names[note % 12];
+        int len = snprintf(
+            uart_tx_buf, sizeof(uart_tx_buf), "%s %s%d ch=%d vel=%d\r\n",
+            note_on ? "NOTE ON " : "NOTE OFF", name, octave, channel, velocity);
 
-                int len = snprintf(uart_tx_buf, sizeof(uart_tx_buf),
-                                   "%s %s%d ch=%d vel=%d\r\n",
-                                   note_on ? "NOTE ON " : "NOTE OFF",
-                                   name, octave,
-                                   channel,
-                                   velocity);
+        HAL_UART_Transmit(&huart1, (uint8_t *)uart_tx_buf, len, HAL_MAX_DELAY);
 
-                HAL_UART_Transmit(&huart1,
-                                  (uint8_t*)uart_tx_buf,
-                                  len,
-                                  HAL_MAX_DELAY);
+        // >>> USB MIDI <<<
+        USB_MIDI_SendNote(note, velocity, channel - 1, note_on);
 
-                data_count = 0; // reset do kolejnego komunikatu
-            }
-        }
-
-    next_byte:
-        // ponownie uruchamiamy odbiór kolejnego bajtu MIDI
-        HAL_UART_Receive_IT(&huart2, &midi_rx_byte, 1);
+        data_count = 0;
+      }
     }
+
+  next_byte:
+    // ponownie uruchamiamy odbiór kolejnego bajtu MIDI
+    HAL_UART_Receive_IT(&huart2, &midi_rx_byte, 1);
+  }
 }
 
 /* USER CODE END 0 */
@@ -155,6 +168,7 @@ int main(void) {
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
   HAL_UART_Receive_IT(&huart2, &midi_rx_byte, 1);
   /* USER CODE END 2 */
@@ -176,6 +190,7 @@ int main(void) {
 void SystemClock_Config(void) {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
    * in the RCC_OscInitTypeDef structure.
@@ -201,6 +216,11 @@ void SystemClock_Config(void) {
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USB;
+  PeriphClkInit.UsbClockSelection = RCC_USBCLKSOURCE_PLL_DIV1_5;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK) {
     Error_Handler();
   }
 }
