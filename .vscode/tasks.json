@@ -1,0 +1,41 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "shell",
+            "label": "Build",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "build/Debug"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "type": "shell",
+            "label": "Flash",
+            "command": "STM32_Programmer_CLI",
+            "args": [
+                "-c",
+                "port=SWD",
+                "-d",
+                "build/Debug/${fileWorkspaceFolderBasename}.elf",
+                "-hardRst",
+                "-rst",
+                "--start"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
+            "problemMatcher": [],
+            "dependsOn": [
+                "Build"
+            ]
+        }
+    ]
+}
